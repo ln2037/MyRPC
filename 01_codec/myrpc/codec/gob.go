@@ -36,7 +36,7 @@ func (c *GobCodec) ReadHeader(header *Header) error {
 
 // ReadBody 读取body的数据
 func (c *GobCodec) ReadBody(body interface{}) error {
-	// todo 不添加引用是否能获取到数据
+	//  body是一个指针
 	return c.decoder.Decode(body)
 }
 

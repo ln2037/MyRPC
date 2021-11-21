@@ -3,11 +3,12 @@ package myrpc
 import (
 	"MyRpc/02_client/myrpc/codec"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -25,11 +26,52 @@ var DefaultOption = &Option{
 }
 
 // Server 代表一个MyRpc服务
-type Server struct { }
+type Server struct {
+	serviceMap sync.Map
+}
 
 // NewServer 返回一个MyRpc实例
 func NewServer() *Server {
 	return &Server{}
+}
+
+// 找到对应的服务和方法
+func (server *Server) findService(serviceMethod string) (svc *service, metType *methodType, err error) {
+	// 找出服务名和方法名
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[: dot], serviceMethod[dot + 1: ]
+	serv, ok := server.serviceMap.Load(serviceName)
+	// 若服务未注册，返回
+	if ok == false {
+		err = errors.New("rpc server: can`t find service " + serviceName)
+		return
+	}
+	svc = serv.(*service)
+	metType = svc.method[methodName]
+	// 若方法不存在，返回
+	if metType == nil {
+		err = errors.New("rpc server: can`t find method " + methodName)
+	}
+	return
+}
+
+// 发布方法
+func (server *Server) Register(receiver interface{}) error {
+	// 获得一个服务
+	s := newService(receiver)
+	if _, dup := server.serviceMap.LoadOrStore(s.name, s); dup {
+		return errors.New("rpc: service already defined: " + s.name)
+	}
+	return nil
+}
+
+// 发布receiver的方法
+func Register(receiver interface{}) error {
+	return DefaultServer.Register(receiver)
 }
 
 // DefaultServer is the default instance of *Server.
@@ -94,9 +136,13 @@ func (server *Server) ServeCodec(cc codec.Codec) {
 // 对请求进行处理
 func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println(req.header, req.argv.Elem())
+	err := req.service.call(req.metType, req.argv, req.replyv)
+	if err != nil {
+		req.header.Error = err.Error()
+		server.sendResponse(cc, req.header, invalidRequest, sending)
+		return
+	}
 	// 返回结果
-	req.replyv = reflect.ValueOf(fmt.Sprintf("MyRpc resp %d", req.header.Seq))
 	server.sendResponse(cc, req.header, req.replyv.Interface(), sending)
 }
 
@@ -123,21 +169,37 @@ func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 
 // request stores all information of a call
 type request struct {
-	header            *codec.Header // header of request
-	argv, replyv reflect.Value // argv and replyv of request
+	header			*codec.Header // header of request
+	argv, replyv 	reflect.Value // argv and replyv of request
+	metType			*methodType	// 方法类型
+	service			*service // 服务
 }
 
 func (server *Server) readRequest(cc codec.Codec) (*request, error) {
 	// 获取请求的Header
 	header, err := server.readRequestHeader(cc)
-	if err != nil {
+	if err != nil 	{
 		return nil, err
 	}
 	req := &request{header: header}
-	// 获取请求的Body, 需要反射
-	req.argv = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.argv.Interface()); err != nil {
+	req.service, req.metType, err = server.findService(req.header.ServiceMethod)
+	if err != nil {
+		return nil, err
+	}
+	// 获取到的是一个实例化的值,并能够修改其值
+	req.argv = req.metType.newArgv()
+	req.replyv = req.metType.newReplyv()
+
+	//需要获得req.argv的指针，这样能通过readBody为其赋值
+	argvi := req.argv.Interface()
+	if req.argv.Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+
+	// 获取请求的Body。argvi是一个指针类型
+	if err = cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read argv err:", err)
+		return req, err
 	}
 	return req, nil
 }
