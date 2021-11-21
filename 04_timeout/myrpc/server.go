@@ -1,28 +1,33 @@
 package myrpc
 
 import (
-	"MyRpc/03_service/myrpc/codec"
+	"MyRpc/04_timeout/myrpc/codec"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"reflect"
 	"strings"
 	"sync"
+	"time"
 )
 
 const MagicNumber = 0x3bef5c
 
 // Option 编码方式
 type Option struct {
-	MagicNumber	int			// 标记这是myrpc请求
-	CodecType	codec.Type	// 编码类型
+	MagicNumber		int			// 标记这是myrpc请求
+	CodecType		codec.Type	// 编码类型
+	ConnectTimeout	time.Duration
+	HandleTimeout	time.Duration
 }
 
 var DefaultOption = &Option{
 	MagicNumber:	MagicNumber,
 	CodecType:		codec.GobType,
+	ConnectTimeout:	time.Second * 10,
 }
 
 // Server 代表一个MyRpc服务
@@ -102,13 +107,13 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 	}
 	//获取消息的解码器
 	//调用serveCodec
-	server.ServeCodec(newCodec(conn))
+	server.ServeCodec(newCodec(conn), &option)
 }
 
 // invalidRequest is a placeholder for response argv when error occurs
 var invalidRequest = struct{}{}
 
-func (server *Server) ServeCodec(cc codec.Codec) {
+func (server *Server) ServeCodec(cc codec.Codec, opt *Option) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
@@ -126,7 +131,7 @@ func (server *Server) ServeCodec(cc codec.Codec) {
 		}
 		wg.Add(1)
 		//请求无误，开始处理
-		go server.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	//等待所有请求处理完毕
 	wg.Wait()
@@ -134,16 +139,41 @@ func (server *Server) ServeCodec(cc codec.Codec) {
 }
 
 // 对请求进行处理
-func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.service.call(req.metType, req.argv, req.replyv)
-	if err != nil {
-		req.header.Error = err.Error()
-		server.sendResponse(cc, req.header, invalidRequest, sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.service.call(req.metType, req.argv, req.replyv)
+		called <- struct{}{}
+		if err != nil {
+			req.header.Error = err.Error()
+			server.sendResponse(cc, req.header, invalidRequest, sending)
+			// 这里不能忘
+			sent <- struct{}{}
+			return
+		}
+		// 返回结果
+		server.sendResponse(cc, req.header, req.replyv.Interface(), sending)
+		sent <- struct{}{}
+	}()
+	// 若没有设置超时
+	if timeout == 0 {
+		<-called
+		<-sent
+		// 直接返回
 		return
 	}
-	// 返回结果
-	server.sendResponse(cc, req.header, req.replyv.Interface(), sending)
+	// 设置了超时时间
+	select {
+	case <-time.After(timeout):
+		// 本来想超时后会不会这里设置header的error后，已经开启的go程把它修改了。后来发现不会
+		// 在超时前的代码里，不会修改header.error的值
+		req.header.Error = fmt.Sprintf("rpc server: request handle timeout: expect within %s", timeout)
+		server.sendResponse(cc, req.header, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
 }
 
 func (server *Server) sendResponse(cc codec.Codec, header *codec.Header, body interface{}, sending *sync.Mutex) {
