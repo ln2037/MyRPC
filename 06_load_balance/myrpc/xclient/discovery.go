@@ -66,9 +66,9 @@ func (d *MultiServersDiscovery) Get(mode SelectMode) (string, error) {
 
 // GetAll 获取所有的服务
 func (d *MultiServersDiscovery) GetAll() ([]string, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	servers := make([]string, len(d.servers))
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	servers := make([]string, len(d.servers), len(d.servers))
 	copy(servers, d.servers)
 	return servers, nil
 }
